@@ -3,35 +3,8 @@ import google.generativeai as genai
 import itertools # Para gerar pares de AFOs
 import json # Para salvar e carregar o estado, se necessário
 
-# Importações para Firebase (mantidas conforme instrução, mesmo que não usadas para persistência neste exemplo)
-# Estas variáveis são fornecidas pelo ambiente Canvas e são essenciais para a inicialização do Firebase.
-# Elas permitem que o aplicativo se conecte ao Firestore e gerencie a autenticação do usuário.
-# O 'typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'' é um fallback
-# caso as variáveis não estejam definidas, o que é útil para testes locais fora do ambiente Canvas.
-#from firebase_admin import credentials, initialize_app
-#from firebase_admin import firestore
-#from firebase_admin import auth
-
-# Variáveis globais fornecidas pelo ambiente Canvas
-#appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-#firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-#initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
-
-# Inicializa o Firebase
-# O Firebase é utilizado para gerenciar dados e autenticação de usuários.
-# A inicialização é um passo fundamental para que o aplicativo possa interagir
-# com os serviços de backend do Google Cloud, como o Firestore para armazenamento de dados.
-#if not firebase_admin._apps:
-#    cred = credentials.Certificate(firebaseConfig)
-#    initialize_app(cred)
-
-#db = firestore.client()
-#auth_instance = auth.Client(app=None) # Usar o app padrão
-
-# --- Configuração da API Gemini (como o "ChatGPT" que você mencionou) ---
+# --- Configuração da API Gemini ---
 # A chave da API será carregada de forma segura pelo Streamlit
-# O modelo 'gemini-2.0-flash' é um modelo de linguagem grande e rápido,
-# ideal para simular o especialista de domínio.
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 model = genai.GenerativeModel('gemini-2.0-flash')
 
@@ -48,13 +21,23 @@ if 'dominio_processo' not in st.session_state:
 if 'afos' not in st.session_state:
     st.session_state.afos = [] # Lista de Atividades e Eventos Iniciais (AFOs)
 if 'relacoes' not in st.session_state:
-    st.session_state.relacoes = [] # Lista de relações SBMN identificadas (DEP, XOR, etc.)
+    st.session_state.relacoes = [] # Lista de relações SBMN identificadas (DEP, DEPC, XOR, UNI)
 if 'pares_pendentes' not in st.session_state:
-    st.session_state.pares_pendentes = [] # Pares de AFOs que ainda precisam ser questionados
+    st.session_state.pares_pendentes = [] # Pares de AFOs que ainda precisam ser questionados (tuplas: AFO_A, AFO_B)
 if 'indice_par_atual' not in st.session_state:
     st.session_state.indice_par_atual = 0 # Índice do par de AFOs atual sendo questionado
 if 'pergunta_tipo' not in st.session_state:
-    st.session_state.pergunta_tipo = "DEP" # Tipo de pergunta SBMN (DEP, XOR, UNI)
+    st.session_state.pergunta_tipo = "DEP_INICIAL" # Tipo de pergunta SBMN (DEP_INICIAL, DEP_COMPLEMENTAR, XOR, UNI)
+if 'resposta_dep_inicial' not in st.session_state:
+    st.session_state.resposta_dep_inicial = None # Para armazenar a resposta da primeira pergunta de DEP e decidir se DEPC é feita
+# Variáveis de estado para as checkboxes da UNI
+if 'uni_apenas_a_ocorre' not in st.session_state:
+    st.session_state.uni_apenas_a_ocorre = False
+if 'uni_apenas_b_ocorre' not in st.session_state:
+    st.session_state.uni_apenas_b_ocorre = False
+if 'uni_ambos_ocorrem' not in st.session_state:
+    st.session_state.uni_ambos_ocorrem = False
+
 
 # --- Funções Auxiliares ---
 
@@ -65,82 +48,104 @@ def avancar_fase(proxima_fase):
     st.session_state.fase = proxima_fase
     st.rerun() # Recarrega a página para mostrar a nova fase
 
-def gerar_proximo_par_e_tipo():
+def avancar_pergunta_sbm_para_proximo_par():
     """
-    Lógica para avançar entre os tipos de perguntas (DEP, XOR, UNI) para cada par de AFOs.
-    Quando todas as perguntas para um par são feitas, avança para o próximo par.
+    Controla o fluxo das perguntas SBMN (DEP_INICIAL, DEP_COMPLEMENTAR, XOR, UNI)
+    e avança para o próximo par de AFOs quando todas as perguntas são feitas.
     """
-    if not st.session_state.pares_pendentes:
-        st.session_state.fase = "encerramento"
-        return None, None, None
+    # Resetar os estados das checkboxes da UNI para o próximo par
+    st.session_state.uni_apenas_a_ocorre = False
+    st.session_state.uni_apenas_b_ocorre = False
+    st.session_state.uni_ambos_ocorrem = False
 
-    a, b = st.session_state.pares_pendentes[st.session_state.indice_par_atual]
-
-    if st.session_state.pergunta_tipo == "DEP":
+    if st.session_state.pergunta_tipo == "DEP_INICIAL":
+        if st.session_state.resposta_dep_inicial == "Sim":
+            st.session_state.pergunta_tipo = "DEP_COMPLEMENTAR"
+        else: # Respondeu "Não" para a DEP_INICIAL, então não há DEPC. Vai direto para XOR.
+            st.session_state.pergunta_tipo = "XOR"
+    elif st.session_state.pergunta_tipo == "DEP_COMPLEMENTAR":
         st.session_state.pergunta_tipo = "XOR"
-        return a, b, "DEP"
     elif st.session_state.pergunta_tipo == "XOR":
-        # Se XOR foi a última pergunta para o par atual, avança para o próximo par
+        st.session_state.pergunta_tipo = "UNI"
+    elif st.session_state.pergunta_tipo == "UNI":
+        # Todas as perguntas para o par atual foram feitas, avança para o próximo par
         st.session_state.indice_par_atual += 1
-        st.session_state.pergunta_tipo = "DEP" # Reinicia para o próximo par
+        st.session_state.pergunta_tipo = "DEP_INICIAL" # Reinicia o ciclo de perguntas para o novo par
+        st.session_state.resposta_dep_inicial = None # Reset para o novo par
 
-        # Verifica se ainda há pares antes de tentar acessar
-        if st.session_state.indice_par_atual < len(st.session_state.pares_pendentes):
-            next_a, next_b = st.session_state.pares_pendentes[st.session_state.indice_par_atual]
-            return next_a, next_b, "DEP" # Retorna a primeira pergunta (DEP) para o novo par
-        else:
-            st.session_state.fase = "encerramento"
-            return None, None, None # Não há mais pares, encerra a entrevista
+    # Verifica se ainda há pares antes de tentar acessar
+    if st.session_state.indice_par_atual >= len(st.session_state.pares_pendentes):
+        st.session_state.fase = "encerramento"
+        st.rerun()
 
-    # Caso chegue aqui sem um tipo definido (não deve acontecer com o fluxo acima)
-    st.session_state.fase = "encerramento"
-    return None, None, None
-
-def verificar_inconsistencia(relacao, afo1, afo2=None):
+def verificar_inconsistencia(relacao):
     """
     Função de placeholder para verificação de inconsistências SBMN.
     Em um sistema real, esta lógica seria muito mais complexa e robusta,
     envolvendo a análise de um grafo de dependências.
-    Aqui, vamos simular uma detecção de DEP e XOR para o mesmo par,
+    Aqui, vamos simular uma detecção de DEP (estrita) e XOR para o mesmo par,
     que é uma inconsistência comum.
     """
-    inconsistencias_detectadas = []
+    afo1 = relacao['afo1']
+    afo2 = relacao['afo2']
+    tipo = relacao['tipo']
+    resposta_validada = relacao['sua_validacao']
 
-    # Exemplo simples: Detecção de DEP e XOR para o mesmo par
-    if relacao['tipo'] == 'DEP' and relacao['sua_validacao'] == 'Sim':
-        for r in st.session_state.relacoes:
-            if r['tipo'] == 'XOR' and r['sua_validacao'] == 'Sim':
-                # Verifica se os AFOs são os mesmos, em qualquer ordem
-                if (r['afo1'] == afo1 and r['afo2'] == afo2) or \
-                   (r['afo1'] == afo2 and r['afo2'] == afo1):
-                    inconsistencias_detectadas.append(
-                        f"Inconsistência detectada: 'DEP' e 'XOR' para o mesmo par ({afo1}, {afo2}). "
-                        "Isso significa que B depende de A E A e B não podem ocorrer juntas. "
-                        "Por favor, reavalie a relação."
-                    )
-                    st.warning(inconsistencias_detectadas[-1])
-                    break # Para de verificar após encontrar a primeira inconsistência para este par
+    # Exemplo simples: Detecção de DEP e XOR para o mesmo par (Equivalent Operators)
+    # Se uma DEP estrita foi validada E uma XOR também foi validada para o mesmo par.
+    if resposta_validada == "Sim":
+        if tipo == 'DEP': 
+            for r in st.session_state.relacoes:
+                # Verifica se a relação existente é XOR e foi validada como Sim
+                if r['tipo'] == 'XOR' and r['sua_validacao'] == 'Não': # 'Não' para "podem ocorrer juntas?" significa que É XOR.
+                    # Verifica se os AFOs são os mesmos, em qualquer ordem
+                    if (r['afo1'] == afo1 and r['afo2'] == afo2) or \
+                       (r['afo1'] == afo2 and r['afo2'] == afo1):
+                        st.warning(
+                            f"**Inconsistência detectada (Equivalent Operators):** "
+                            f"As tarefas '{afo1}' e '{afo2}' possuem uma Dependência Estrita E uma Não-Coexistência (XOR). "
+                            "Isso significa que uma depende da outra E elas não podem ocorrer juntas, o que é contraditório. "
+                            "Por favor, reavalie a relação para esse par."
+                        )
+                        break
+        elif tipo == 'XOR': # Se uma XOR foi validada E uma DEP estrita também foi validada para o mesmo par.
+             for r in st.session_state.relacoes:
+                # Verifica se a relação existente é DEP e foi validada como Sim
+                if r['tipo'] == 'DEP' and r['sua_validacao'] == 'Sim': 
+                    # Verifica se os AFOs são os mesmos, em qualquer ordem
+                    if (r['afo1'] == afo1 and r['afo2'] == afo2) or \
+                       (r['afo1'] == afo2 and r['afo2'] == afo1):
+                        st.warning(
+                            f"**Inconsistência detectada (Equivalent Operators):** "
+                            f"As tarefas '{afo1}' e '{afo2}' possuem uma Dependência Estrita E uma Não-Coexistência (XOR). "
+                            "Isso significa que uma depende da outra E elas não podem ocorrer juntas, o que é contraditório. "
+                            "Por favor, reavalie a relação para esse par."
+                        )
+                        break
 
     # Você adicionaria mais lógica aqui para outros tipos de inconsistências SBMN
     # (Ex: Ciclos de dependência, Bloqueio de dependência indireta, Promiscuidade, Dependência Dual)
 
-    return inconsistencias_detectadas
-
-def obter_resposta_ia(pergunta_ao_especialista):
+def obter_resposta_ia(pergunta_ao_especialista, tipo_pergunta_sbm):
     """
     Função para chamar a API do Gemini (LLM) para atuar como o "especialista de domínio".
-    Ele vai responder às perguntas SBMN (Sim/Não ou explicação concisa).
+    Ele vai responder às perguntas SBMN (Sim/Não ou explicação concisa para UNI).
     """
     try:
         # O prompt de sistema orienta a IA sobre seu papel
         system_prompt = (
             f"Você é um especialista de domínio do processo '{st.session_state.nome_processo}' "
             f"no setor de '{st.session_state.dominio_processo}'. "
-            "Eu farei perguntas sobre dependências e exclusões de tarefas (AFOs). "
-            "Responda apenas 'Sim' ou 'Não' quando a pergunta for binária. "
-            "Se precisar de mais contexto ou achar a pergunta ambígua, peça esclarecimentos. "
-            "Se for uma pergunta aberta, forneça uma resposta concisa."
+            "Eu farei perguntas sobre dependências e exclusões de tarefas (AFOs) para modelar um processo. "
         )
+        
+        # Ajusta a instrução para a IA dependendo do tipo de pergunta
+        if tipo_pergunta_sbm == "UNI":
+            # Para UNI, a IA deve responder com uma combinação das opções
+            system_prompt += "Para a próxima pergunta, você deve responder indicando quais das opções são possíveis: 'apenas A', 'apenas B', 'ambos A e B', ou uma combinação dessa (por exemplo, 'apenas A e ambos')."
+        else:
+            # Para DEP e XOR, a IA deve responder Sim ou Não
+            system_prompt += "Responda apenas 'Sim' ou 'Não' quando a pergunta for binária. Se precisar de mais contexto ou achar a pergunta ambígua, peça esclarecimentos."
         
         # Histórico da conversa para manter o contexto
         chat_history = [
@@ -164,7 +169,7 @@ def obter_resposta_ia(pergunta_ao_especialista):
 # --- Interface do Streamlit ---
 
 st.title("Analista de Processos SBMN Virtual")
-st.markdown("Seu objetivo é conduzir entrevistas com especialistas de domínio para **capturar e modelar o comportamento de processos de negócio** de forma declarativa e consistente.")
+st.markdown("Seu objetivo principal é conduzir entrevistas com especialistas de domínio para **capturar e modelar o comportamento de processos de negócio** de forma declarativa e consistente, visando a futura derivação de modelos BPMN executáveis e otimizados.")
 
 # --- Fase 1: Introdução e Coleta de Dados Iniciais ---
 if st.session_state.fase == "introducao":
@@ -190,14 +195,15 @@ if st.session_state.fase == "introducao":
                 # itertools.permutations(lista, 2) cria pares ordenados (A,B) e (B,A)
                 st.session_state.pares_pendentes = list(itertools.permutations(st.session_state.afos, 2))
                 st.session_state.indice_par_atual = 0
-                st.session_state.pergunta_tipo = "DEP" # Começa com a primeira pergunta para o primeiro par
+                st.session_state.pergunta_tipo = "DEP_INICIAL" # Começa com a primeira pergunta para o primeiro par
+                st.session_state.resposta_dep_inicial = None # Reseta a resposta inicial da DEP
                 avancar_fase("entrevista") # Avança para a próxima fase
         else:
             st.error("Por favor, preencha todos os campos para iniciar a entrevista.")
 
 # --- Fase 2: Entrevista Baseada em Situações SBMN ---
 elif st.session_state.fase == "entrevista":
-    st.header("Fase 2: Entrevista Baseada em Situações SBMN")
+    st.header("Fase 2: Entrevista Baseada em Situações SBMN (Coleta de Restrições Declarativas)")
     st.write(f"**Processo:** {st.session_state.nome_processo} | **Domínio:** {st.session_state.dominio_processo}")
     st.markdown("---")
 
@@ -208,63 +214,113 @@ elif st.session_state.fase == "entrevista":
     else:
         afo_a, afo_b = st.session_state.pares_pendentes[st.session_state.indice_par_atual]
         pergunta_ao_ia = ""
-        tipo_relacao_atual = st.session_state.pergunta_tipo
+        tipo_relacao_actual = st.session_state.pergunta_tipo
+
+        st.write(f"**Analisando o par:** `{afo_a}` e `{afo_b}`")
 
         # Formula a pergunta com base no tipo de relação SBMN
-        if tipo_relacao_atual == "DEP":
-            st.subheader("2.1. Dependência Estrita (DEP)")
-            pergunta_ao_ia = f"A tarefa '{afo_b}' **depende estritamente** da tarefa '{afo_a}' para ocorrer? Ou seja, '{afo_b}' *só pode* começar se '{afo_a}' tiver sido concluída?"
-        elif tipo_relacao_atual == "XOR":
+        if tipo_relacao_actual == "DEP_INICIAL":
+            st.subheader("2.1. Verificação de Dependência com Classificação (Pergunta Inicial)")
+            pergunta_ao_ia = f"A tarefa '{afo_b}' depende de '{afo_a}' para ocorrer?"
+        elif tipo_relacao_actual == "DEP_COMPLEMENTAR":
+            st.subheader("2.1. Verificação de Dependência com Classificação (Pergunta Complementar)")
+            pergunta_ao_ia = f"Essa dependência é obrigatória? Ou seja, '{afo_b}' só pode começar se '{afo_a}' tiver ocorrido?"
+        elif tipo_relacao_actual == "XOR":
             st.subheader("2.3. Não-Coexistência (XOR)")
-            pergunta_ao_ia = f"As tarefas '{afo_a}' e '{afo_b}' **não podem ocorrer juntas** no mesmo fluxo de processo? Elas se excluem mutuamente?"
-        # Você pode adicionar a lógica para UNI aqui, seguindo o mesmo padrão:
-        # elif tipo_relacao_atual == "UNI":
-        #    st.subheader("2.4. União Inclusiva (UNI)")
-        #    pergunta_ao_ia = f"Pode ocorrer apenas '{afo_a}', apenas '{afo_b}', ou **ambos** '{afo_a}' e '{afo_b}' no mesmo fluxo de processo? (Ou seja, pelo menos um deles deve ocorrer, mas ambos podem ocorrer)."
+            pergunta_ao_ia = f"As tarefas '{afo_a}' e '{afo_b}' **podem ocorrer juntas** no mesmo fluxo de processo?"
+        elif tipo_relacao_actual == "UNI":
+            st.subheader("2.4. União Inclusiva (UNI)")
+            pergunta_ao_ia = (
+                f"Considerando as tarefas '{afo_a}' e '{afo_b}', por favor, me diga qual (ou quais) das seguintes situações são possíveis neste processo: \n"
+                f"- Apenas '{afo_a}' ocorre \n"
+                f"- Apenas '{afo_b}' ocorre \n"
+                f"- Ambos '{afo_a}' e '{afo_b}' ocorrem"
+            )
+            # A instrução para a IA fica no `obter_resposta_ia`, aqui para o usuário, podemos ser mais diretos.
+            # st.caption("Você pode me dizer 'apenas A', 'apenas B', 'ambos', ou uma combinação delas (ex: 'apenas A e ambos').")
 
-        st.write(f"**AFO A:** `{afo_a}` | **AFO B:** `{afo_b}`")
         st.write(pergunta_ao_ia)
 
         # Chama a IA para obter a resposta do "especialista de domínio"
         with st.spinner("Aguardando resposta do especialista (IA)..."):
-            resposta_ia = obter_resposta_ia(pergunta_ao_ia)
+            resposta_ia = obter_resposta_ia(pergunta_ao_ia, tipo_relacao_actual)
         st.info(f"Resposta do Especialista (IA): **{resposta_ia}**")
 
         st.markdown("---")
         st.subheader("Sua Validação (Analista):")
-        # O usuário (você ou o stakeholder) valida a resposta da IA
-        sua_resposta = st.radio("Essa resposta do especialista (IA) está correta para o processo real?", 
-                                 options=["Sim", "Não"], 
-                                 key=f"resp_{afo_a}_{afo_b}_{tipo_relacao_atual}")
+        
+        # --- MODIFICAÇÃO AQUI: Pergunta UNI com Checkboxes ---
+        if tipo_relacao_actual == "UNI":
+            st.markdown("Por favor, confirme as opções que são válidas para o processo:")
+            st.session_state.uni_apenas_a_ocorre = st.checkbox(f"Apenas '{afo_a}' ocorre", key=f"check_a_{afo_a}_{afo_b}", 
+                                                               value=st.session_state.uni_apenas_a_ocorre)
+            st.session_state.uni_apenas_b_ocorre = st.checkbox(f"Apenas '{afo_b}' ocorre", key=f"check_b_{afo_a}_{afo_b}",
+                                                               value=st.session_state.uni_apenas_b_ocorre)
+            st.session_state.uni_ambos_ocorrem = st.checkbox(f"Ambos '{afo_a}' e '{afo_b}' ocorrem", key=f"check_ambos_{afo_a}_{afo_b}",
+                                                              value=st.session_state.uni_ambos_ocorrem)
+            
+            # A resposta para registro será construída a partir do estado das checkboxes
+            resposta_para_registro = []
+            if st.session_state.uni_apenas_a_ocorre:
+                resposta_para_registro.append(f"Apenas {afo_a}")
+            if st.session_state.uni_apenas_b_ocorre:
+                resposta_para_registro.append(f"Apenas {afo_b}")
+            if st.session_state.uni_ambos_ocorrem:
+                resposta_para_registro.append(f"Ambos {afo_a} e {afo_b}")
+            
+            # Converte a lista para uma string para armazenamento
+            resposta_para_registro = ", ".join(resposta_para_registro) if resposta_para_registro else "Nenhuma das opções selecionadas"
+
+        else: # Para DEP e XOR, mantém o radio button
+            sua_resposta_validacao = st.radio("Essa resposta do especialista (IA) está correta para o processo real?", 
+                                                 options=["Sim", "Não"], 
+                                                 key=f"resp_bin_{afo_a}_{afo_b}_{tipo_relacao_actual}")
+            resposta_para_registro = sua_resposta_validacao # "Sim" ou "Não"
+
         observacao = st.text_area("Observações (opcional, para sua anotação):", 
-                                  key=f"obs_{afo_a}_{afo_b}_{tipo_relacao_atual}")
+                                  key=f"obs_{afo_a}_{afo_b}_{tipo_relacao_actual}")
 
         if st.button("Confirmar e Próxima Pergunta"):
             relacao_registrada = {
                 "afo1": afo_a,
                 "afo2": afo_b,
-                "tipo": tipo_relacao_atual,
+                "tipo": "", # O tipo SBMN será classificado abaixo
                 "resposta_ia": resposta_ia,
-                "sua_validacao": sua_resposta,
+                "sua_validacao": resposta_para_registro, # A string construída das checkboxes ou Sim/Não
                 "observacao": observacao
             }
             
-            # Adiciona a relação à lista APENAS se a sua validação for "Sim"
-            if sua_resposta == "Sim":
+            # Lógica para classificar o tipo de relação SBMN e registrar
+            if tipo_relacao_actual == "DEP_INICIAL":
+                st.session_state.resposta_dep_inicial = resposta_para_registro # Armazena a resposta para a próxima etapa
+                if resposta_para_registro == "Não":
+                    relacao_registrada["tipo"] = "SEM_DEPENDÊNCIA"
+                    st.session_state.relacoes.append(relacao_registrada)
+            elif tipo_relacao_actual == "DEP_COMPLEMENTAR":
+                if resposta_para_registro == "Sim":
+                    relacao_registrada["tipo"] = "DEP" # Dependência Estrita
+                else:
+                    relacao_registrada["tipo"] = "DEPC" # Dependência Circunstancial
                 st.session_state.relacoes.append(relacao_registrada)
-                # Verifica inconsistências (simplificado, para demonstração)
-                verificar_inconsistencia(relacao_registrada, afo_a, afo_b)
+                verificar_inconsistencia(relacao_registrada) # Verifica inconsistências após registrar DEP/DEPC
+            elif tipo_relacao_actual == "XOR":
+                # 'Sim' para "podem ocorrer juntas?" significa que NÃO é XOR.
+                # 'Não' para "podem ocorrer juntas?" significa que É XOR.
+                if resposta_para_registro == "Não": 
+                    relacao_registrada["tipo"] = "XOR"
+                else: 
+                    relacao_registrada["tipo"] = "NÃO_XOR" # AFOs podem coexistir
+                st.session_state.relacoes.append(relacao_registrada)
+                verificar_inconsistencia(relacao_registrada) # Verifica inconsistências após registrar XOR
+            elif tipo_relacao_actual == "UNI":
+                # A classificação da UNI agora depende do estado das checkboxes
+                if st.session_state.uni_apenas_a_ocorre and st.session_state.uni_apenas_b_ocorre and st.session_state.uni_ambos_ocorrem:
+                    relacao_registrada["tipo"] = "UNI"
+                else:
+                    relacao_registrada["tipo"] = "NÃO_UNI" # Não é uma UNI completa
+                st.session_state.relacoes.append(relacao_registrada)
 
-            # Lógica para avançar para a próxima pergunta ou próximo par de AFOs
-            if st.session_state.pergunta_tipo == "DEP":
-                st.session_state.pergunta_tipo = "XOR"
-            elif st.session_state.pergunta_tipo == "XOR":
-                st.session_state.indice_par_atual += 1
-                st.session_state.pergunta_tipo = "DEP" # Reinicia para o próximo par
-
-            # Verifica se todos os pares foram questionados
-            if st.session_state.indice_par_atual >= len(st.session_state.pares_pendentes):
-                st.session_state.fase = "encerramento"
+            avancar_pergunta_sbm_para_proximo_par()
             st.rerun() # Recarrega para mostrar a próxima pergunta/fase
 
 
@@ -272,11 +328,13 @@ elif st.session_state.fase == "entrevista":
 elif st.session_state.fase == "encerramento":
     st.header("Fase 4: Encerramento da Entrevista")
     st.write("A entrevista foi concluída ou as condições de encerramento foram atingidas.")
+    
     st.write("### Modelo SBMN Mapeado (Relações Validadas por Você):")
-
     if st.session_state.relacoes:
         for rel in st.session_state.relacoes:
-            st.write(f"- `{rel['afo1']}` **{rel['tipo']}** `{rel['afo2']}` (Resposta IA: '{rel['resposta_ia']}', Validado por você: {rel['sua_validacao']})")
+            tipo_display = rel['tipo'] # O tipo já vem classificado
+            
+            st.write(f"- `{rel['afo1']}` **{tipo_display}** `{rel['afo2']}` (Resposta IA: '{rel['resposta_ia']}', Validado por você: '{rel['sua_validacao']}')")
             if rel['observacao']:
                 st.caption(f"  Obs: {rel['observacao']}")
     else:
@@ -287,6 +345,10 @@ elif st.session_state.fase == "encerramento":
     st.write(", ".join(st.session_state.afos))
 
     st.write("---")
+    st.subheader("4.2. Confirmação Final:")
+    final_confirm = st.text_area("Há mais alguma atividade, evento ou restrição importante que devemos considerar para este processo?")
+    st.write(f"Sua resposta: {final_confirm}")
+
     if st.button("Reiniciar Entrevista"):
         # Limpa todas as variáveis de estado para começar do zero
         for key in st.session_state.keys():
